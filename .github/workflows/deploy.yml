@@ -1,0 +1,118 @@
+name: Build and Deploy FastAPI
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  #
+  # JOB 1: BUILD & PUSH
+  #
+  build-and-push:
+    # Logic: Run if it's a PUSH event
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Image Name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:latest
+
+  #
+  # JOB 2: DEPLOY TO SERVER
+  #
+  deploy-to-server:
+    needs: build-and-push
+    # Run always, unless the build actually FAILED
+    if: ${{ !failure() }}
+    runs-on: self-hosted
+
+    env:
+      SERVICE_NAME: fastapi-app
+      APP_DIR: "projects/testing/fastapi-app"
+
+    steps:
+      - name: Checkout Code (Get Compose File)
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Configure Env & Login
+        run: |
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> $GITHUB_ENV
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Deploy Service
+        run: |
+          TARGET_DIR="$HOME/${{ env.APP_DIR }}"
+          SYSTEMD_DIR="$HOME/.config/systemd/user"
+          COMPOSE_BIN=$(which podman-compose)
+          
+          mkdir -p "$SYSTEMD_DIR"
+          mkdir -p "$TARGET_DIR"
+
+          cp docker-compose.yml "$TARGET_DIR/"
+
+          # Inject Secrets from GitHub into a secure .env file
+          cat <<EOF > "$TARGET_DIR/.env"
+          IMAGE_NAME=${{ env.IMAGE_NAME }}
+          EOF
+          chmod 600 "$TARGET_DIR/.env"
+
+          # --- 4. UPDATE IMAGES ---
+          cd "$TARGET_DIR"
+          echo "Pulling latest images..."
+          $COMPOSE_BIN pull
+
+          # --- 5. GENERATE & RESTART SYSTEMD SERVICE ---
+          cat <<EOF > "$SYSTEMD_DIR/${{ env.SERVICE_NAME }}.service"
+          [Unit]
+          Description=FastAPI App
+          After=network.target
+
+          [Service]
+          WorkingDirectory=$TARGET_DIR
+          Environment="PATH=$PATH"
+          # Force recreate ensures new image usage
+          ExecStart=$COMPOSE_BIN up --remove-orphans --force-recreate
+          ExecStop=$COMPOSE_BIN down
+
+          [Install]
+          WantedBy=default.target
+          EOF
+
+          systemctl --user daemon-reload
+          systemctl --user enable "${{ env.SERVICE_NAME }}"
+          echo "Restarting Service..."
+          systemctl --user restart "${{ env.SERVICE_NAME }}"
+
+      - name: Verify Deployment
+        if: always()
+        run: |
+          sleep 10
+          systemctl --user status "${{ env.SERVICE_NAME }}" --no-pager -l || true
+          podman ps
